@@ -452,6 +452,52 @@ func shouldRetryHeaders(ctx context.Context, headers swift.Headers, err error) (
 	return shouldRetry(ctx, err)
 }
 
+// exitOnAuthFailure checks whether err is an authentication-related error.
+// If so it logs a clear message. If the --exit-on-auth-fail flag is enabled
+// via fs.ConfigInfo.ExitOnAuthFail it also calls fs.Fatalf to terminate the
+// mount process (useful for systemd auto-restart scenarios).
+//
+// The distinction between an auth 404 and a normal 404 (file/container not
+// found) is made by inspecting the error text — the swift library only
+// populates swift.Error for auth-related 404 when the response body contains
+// "Application Credential", which never appears for normal storage 404s.
+//
+// This function is intentionally placed here rather than in the pacer core
+// because the auth-error semantics (HTTP 401 = auth, 404 with specific body
+// text = auth) are Swift-specific.
+func (f *Fs) exitOnAuthFailure(ctx context.Context, url string, err error) {
+	swiftErr, ok := err.(*swift.Error)
+	if !ok {
+		return
+	}
+
+	isAuthFail := false
+	switch swiftErr.StatusCode {
+	case 401:
+		isAuthFail = true
+	case 404:
+		// 404 from Keystone auth endpoint when the application credential
+		// has been deleted: the body contains "Could not find Application Credential".
+		// Normal storage 404s are returned as sentinel errors
+		// (swift.ContainerNotFound, swift.ObjectNotFound) which have different Text.
+		isAuthFail = strings.Contains(swiftErr.Text, "Application Credential")
+	}
+	if !isAuthFail {
+		return
+	}
+
+	// Authentication failure detected — log clearly
+	fs.Errorf(nil, "AUTH FAILURE: HTTP %d [%s]", swiftErr.StatusCode, url)
+	if swiftErr.StatusCode == 404 {
+		fs.Errorf(nil, "Auth failure details: %v", swiftErr)
+	}
+
+	// Exit if --exit-on-auth-fail is enabled
+	if f.ci.ExitOnAuthFail {
+		fs.Fatalf(nil, "Authentication failure: credentials must be reconfigured and rclone restarted")
+	}
+}
+
 // parsePath parses a remote 'url'
 func parsePath(path string) (root string) {
 	root = strings.Trim(path, "/")
@@ -564,6 +610,7 @@ func (f *Fs) setRoot(root string) {
 // Fetch the base container's policy to be used if/when we need to create a
 // segments container to ensure we use the same policy.
 func (f *Fs) fetchStoragePolicy(ctx context.Context, container string) (fs.Fs, error) {
+	containerURL := f.c.StorageUrl + "/" + container
 	err := f.pacer.Call(func() (bool, error) {
 		var rxHeaders swift.Headers
 		_, rxHeaders, err := f.c.Container(ctx, container)
@@ -571,6 +618,7 @@ func (f *Fs) fetchStoragePolicy(ctx context.Context, container string) (fs.Fs, e
 		f.opt.StoragePolicy = rxHeaders["X-Storage-Policy"]
 		fs.Debugf(f, "Auto set StoragePolicy to %s", f.opt.StoragePolicy)
 
+		f.exitOnAuthFailure(ctx, containerURL, err)
 		return shouldRetryHeaders(ctx, rxHeaders, err)
 	})
 	return nil, err
@@ -611,9 +659,11 @@ func NewFsWithConnection(ctx context.Context, opt *Options, name, root string, c
 		var info swift.Object
 		var err error
 		encodedDirectory := f.opt.Enc.FromStandardPath(f.rootDirectory)
+		objectURL := f.c.StorageUrl + "/" + f.rootContainer + "/" + encodedDirectory
 		err = f.pacer.Call(func() (bool, error) {
 			var rxHeaders swift.Headers
 			info, rxHeaders, err = f.c.Object(ctx, f.rootContainer, encodedDirectory)
+			f.exitOnAuthFailure(ctx, objectURL, err)
 			return shouldRetryHeaders(ctx, rxHeaders, err)
 		})
 		if err == nil && info.ContentType != directoryMarkerContentType {
@@ -720,8 +770,10 @@ func (f *Fs) listContainerRoot(ctx context.Context, container, directory, prefix
 	return f.c.ObjectsWalk(ctx, container, &opts, func(ctx context.Context, opts *swift.ObjectsOpts) (any, error) {
 		var objects []swift.Object
 		var err error
+		objectURL := f.c.StorageUrl + "/" + container
 		err = f.pacer.Call(func() (bool, error) {
 			objects, err = f.c.Objects(ctx, container, opts)
+			f.exitOnAuthFailure(ctx, objectURL, err)
 			return shouldRetry(ctx, err)
 		})
 		if err == nil {
@@ -808,8 +860,10 @@ func (f *Fs) listDir(ctx context.Context, container, directory, prefix string, a
 // listContainers lists the containers
 func (f *Fs) listContainers(ctx context.Context) (entries fs.DirEntries, err error) {
 	var containers []swift.Container
+	containerURL := f.c.StorageUrl + "/"
 	err = f.pacer.Call(func() (bool, error) {
 		containers, err = f.c.ContainersAll(ctx, nil)
+		f.exitOnAuthFailure(ctx, containerURL, err)
 		return shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -933,8 +987,10 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	var used, objects, total int64
 	if f.rootContainer != "" {
 		var container swift.Container
+		containerURL := f.c.StorageUrl + "/" + f.rootContainer
 		err = f.pacer.Call(func() (bool, error) {
 			container, _, err = f.c.Container(ctx, f.rootContainer)
+			f.exitOnAuthFailure(ctx, containerURL, err)
 			return shouldRetry(ctx, err)
 		})
 		if err != nil {
@@ -945,9 +1001,11 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 		total = container.QuotaBytes
 
 		if f.opt.UseSegmentsContainer.Value {
+			segmentsContainer := f.rootContainer + segmentsContainerSuffix
+			segmentsURL := f.c.StorageUrl + "/" + segmentsContainer
 			err = f.pacer.Call(func() (bool, error) {
-				segmentsContainer := f.rootContainer + segmentsContainerSuffix
 				container, _, err = f.c.Container(ctx, segmentsContainer)
+				f.exitOnAuthFailure(ctx, segmentsURL, err)
 				return shouldRetry(ctx, err)
 			})
 			if err != nil && err != swift.ContainerNotFound {
@@ -959,8 +1017,10 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 		}
 	} else {
 		var containers []swift.Container
+		containerURL := f.c.StorageUrl + "/"
 		err = f.pacer.Call(func() (bool, error) {
 			containers, err = f.c.ContainersAll(ctx, nil)
+			f.exitOnAuthFailure(ctx, containerURL, err)
 			return shouldRetry(ctx, err)
 		})
 		if err != nil {
@@ -1014,10 +1074,12 @@ func (f *Fs) makeContainer(ctx context.Context, container string) error {
 	return f.cache.Create(container, func() error {
 		// Check to see if container exists first
 		var err error = swift.ContainerNotFound
+		containerURL := f.c.StorageUrl + "/" + container
 		if !f.noCheckContainer {
 			err = f.pacer.Call(func() (bool, error) {
 				var rxHeaders swift.Headers
 				_, rxHeaders, err = f.c.Container(ctx, container)
+				f.exitOnAuthFailure(ctx, containerURL, err)
 				return shouldRetryHeaders(ctx, rxHeaders, err)
 			})
 		}
@@ -1026,8 +1088,10 @@ func (f *Fs) makeContainer(ctx context.Context, container string) error {
 			if f.opt.StoragePolicy != "" {
 				headers["X-Storage-Policy"] = f.opt.StoragePolicy
 			}
+			createURL := f.c.StorageUrl + "/" + container
 			err = f.pacer.Call(func() (bool, error) {
 				err = f.c.ContainerCreate(ctx, container, headers)
+				f.exitOnAuthFailure(ctx, createURL, err)
 				return shouldRetry(ctx, err)
 			})
 			if err == nil {
@@ -1047,8 +1111,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return nil
 	}
 	err := f.cache.Remove(container, func() error {
+		containerURL := f.c.StorageUrl + "/" + container
 		err := f.pacer.Call(func() (bool, error) {
 			err := f.c.ContainerDelete(ctx, container)
+			f.exitOnAuthFailure(ctx, containerURL, err)
 			return shouldRetry(ctx, err)
 		})
 		if err == nil {
@@ -1124,9 +1190,11 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		err = f.copyLargeObject(ctx, srcObj, dstContainer, dstPath)
 	} else {
 		srcContainer, srcPath := srcObj.split()
+		copyURL := f.c.StorageUrl + "/" + srcContainer + "/" + srcPath
 		err = f.pacer.Call(func() (bool, error) {
 			var rxHeaders swift.Headers
 			rxHeaders, err = f.c.ObjectCopy(ctx, srcContainer, srcPath, dstContainer, dstPath, nil)
+			f.exitOnAuthFailure(ctx, copyURL, err)
 			return shouldRetryHeaders(ctx, rxHeaders, err)
 		})
 	}
@@ -1226,9 +1294,11 @@ func (su *segmentedUpload) uploadManifest(ctx context.Context, contentType strin
 	headers["Content-Length"] = "0" // set Content-Length as we know it
 	emptyReader := bytes.NewReader(nil)
 	fs.Debugf(su.f, "uploading manifest %q to %q", su.dstPath, su.dstContainer)
+	manifestURL := su.f.c.StorageUrl + "/" + su.dstContainer + "/" + su.dstPath
 	err = su.f.pacer.Call(func() (bool, error) {
 		var rxHeaders swift.Headers
 		rxHeaders, err = su.f.c.ObjectPut(ctx, su.dstContainer, su.dstPath, emptyReader, true, "", contentType, headers)
+		su.f.exitOnAuthFailure(ctx, manifestURL, err)
 		return shouldRetryHeaders(ctx, rxHeaders, err)
 	})
 	return err
@@ -1250,9 +1320,11 @@ func (f *Fs) copyLargeObject(ctx context.Context, src *Object, dstContainer stri
 	defer atexit.OnError(&err, su.onFail)()
 	for i, srcSegment := range srcSegments {
 		dstSegment := su.segmentPath(i)
+		copyURL := f.c.StorageUrl + "/" + srcSegmentsContainer + "/" + srcSegment
 		err = f.pacer.Call(func() (bool, error) {
 			var rxHeaders swift.Headers
 			rxHeaders, err = f.c.ObjectCopy(ctx, srcSegmentsContainer, srcSegment, su.container, dstSegment, nil)
+			f.exitOnAuthFailure(ctx, copyURL, err)
 			return shouldRetryHeaders(ctx, rxHeaders, err)
 		})
 		if err != nil {
@@ -1398,8 +1470,10 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 	var info swift.Object
 	var h swift.Headers
 	container, containerPath := o.split()
+	objectURL := o.fs.c.StorageUrl + "/" + container + "/" + containerPath
 	err = o.fs.pacer.Call(func() (bool, error) {
 		info, h, err = o.fs.c.Object(ctx, container, containerPath)
+		o.fs.exitOnAuthFailure(ctx, objectURL, err)
 		return shouldRetryHeaders(ctx, h, err)
 	})
 	if err != nil {
@@ -1454,8 +1528,10 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 		}
 	}
 	container, containerPath := o.split()
+	updateURL := o.fs.c.StorageUrl + "/" + container + "/" + containerPath
 	return o.fs.pacer.Call(func() (bool, error) {
 		err = o.fs.c.ObjectUpdate(ctx, container, containerPath, newHeaders)
+		o.fs.exitOnAuthFailure(ctx, updateURL, err)
 		return shouldRetry(ctx, err)
 	})
 }
@@ -1474,9 +1550,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	headers := fs.OpenOptionHeaders(options)
 	_, isRanging := headers["Range"]
 	container, containerPath := o.split()
+	openURL := o.fs.c.StorageUrl + "/" + container + "/" + containerPath
 	err = o.fs.pacer.Call(func() (bool, error) {
 		var rxHeaders swift.Headers
 		in, rxHeaders, err = o.fs.c.ObjectOpen(ctx, container, containerPath, !isRanging, headers)
+		o.fs.exitOnAuthFailure(ctx, openURL, err)
 		return shouldRetryHeaders(ctx, rxHeaders, err)
 	})
 	return
@@ -1557,10 +1635,12 @@ func (o *Object) updateChunks(ctx context.Context, in0 io.Reader, headers swift.
 		}
 		segmentReader := io.LimitReader(in, n)
 		segmentPath := su.segmentPath(i)
+		segmentURL := o.fs.c.StorageUrl + "/" + su.container + "/" + segmentPath
 		fs.Debugf(o, "Uploading segment file %q into %q", segmentPath, su.container)
 		err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 			var rxHeaders swift.Headers
 			rxHeaders, err = o.fs.c.ObjectPut(ctx, su.container, segmentPath, segmentReader, true, "", "", headers)
+			o.fs.exitOnAuthFailure(ctx, segmentURL, err)
 			return shouldRetryHeaders(ctx, rxHeaders, err)
 		})
 		if err != nil {
@@ -1623,8 +1703,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			in = inCount
 		}
 		var rxHeaders swift.Headers
+		putURL := o.fs.c.StorageUrl + "/" + container + "/" + containerPath
 		err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 			rxHeaders, err = o.fs.c.ObjectPut(ctx, container, containerPath, in, true, "", contentType, headers)
+			o.fs.exitOnAuthFailure(ctx, putURL, err)
 			return shouldRetryHeaders(ctx, rxHeaders, err)
 		})
 		if err != nil {
@@ -1684,12 +1766,14 @@ func (o *Object) Remove(ctx context.Context) (err error) {
 		}
 	}
 	// Remove file/manifest first
+	deleteURL := o.fs.c.StorageUrl + "/" + container + "/" + containerPath
 	err = o.fs.pacer.Call(func() (bool, error) {
 		err = o.fs.c.ObjectDelete(ctx, container, containerPath)
 		if err == swift.ObjectNotFound {
 			fs.Errorf(o, "Dangling object - ignoring: %v", err)
 			err = nil
 		}
+		o.fs.exitOnAuthFailure(ctx, deleteURL, err)
 		return shouldRetry(ctx, err)
 	})
 	if err != nil {

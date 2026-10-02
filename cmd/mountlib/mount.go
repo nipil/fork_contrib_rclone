@@ -165,6 +165,14 @@ var OptionsInfo = fs.Options{{
 	}(),
 	Help:   "Time to wait for ready mount from daemon (maximum time on Linux, constant sleep time on OSX/BSD) (not supported on Windows)",
 	Groups: "Mount",
+}, {
+	Name:    "exit_on_auth_fail",
+	Default: false,
+	Help: `Exit the mount process on authentication failure (deleted/expired credential).
+When enabled, rclone mount will terminate on auth errors that cannot be
+recovered without reconfiguring credentials. Useful for systemd scenarios
+where the unit should go to "failed" state instead of silently retrying.`,
+	Groups: "Mount",
 }}
 
 func init() {
@@ -195,6 +203,7 @@ type Options struct {
 	NetworkMode        bool          `config:"network_mode"` // Windows only
 	DirectIO           bool          `config:"direct_io"`    // use Direct IO for file access
 	CaseInsensitive    fs.Tristate   `config:"mount_case_insensitive"`
+	ExitOnAuthFail     bool          `config:"exit_on_auth_fail"`
 }
 
 type (

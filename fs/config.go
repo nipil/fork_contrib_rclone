@@ -566,6 +566,12 @@ var ConfigOptionsInfo = Options{{
 	Default: "",
 	Help:    "HTTP proxy URL.",
 	Groups:  "Networking",
+}, {
+	Name:    "exit_on_auth_fail",
+	Default: false,
+	Help: `Exit the mount process on authentication failure (e.g. deleted application credential).
+Useful for systemd scenarios where the unit should go to "failed" state instead of silently retrying.`,
+	Groups:  "Config",
 }}
 
 // ConfigInfo is filesystem config options
@@ -680,6 +686,7 @@ type ConfigInfo struct {
 	MaxConnections             int               `config:"max_connections"`
 	NameTransform              []string          `config:"name_transform"`
 	HTTPProxy                  string            `config:"http_proxy"`
+	ExitOnAuthFail             bool              `config:"exit_on_auth_fail"`
 }
 
 func init() {
